@@ -1805,3 +1805,120 @@ class MMSci_Captioning(ImageBaseDataset):
         )
         dump(rating, eval_file.replace('.xlsx', '_final_rating.xlsx'))
         return rating
+
+class CharXiv(ImageBaseDataset):
+    TYPE = 'VQA'
+    DATASET_URL = {
+        'CharXiv_Descriptive': 'descriptive_questions.tsv',
+        'CharXiv_Reasoning': 'reasoning_questions.tsv',
+    }
+    DATASET_MD5 = {
+    }
+
+    def build_prompt(self, line):
+        from .utils.charxiv import build_descriptive_prompt, build_reasoning_prompt
+        messages = []
+        if isinstance(line, int):
+            line = self.data.iloc[line]
+
+        if self.dataset_name == 'CharXiv_Descriptive':
+            prompt = build_descriptive_prompt(line)
+        elif self.dataset_name == 'CharXiv_Reasoning':
+            prompt = build_reasoning_prompt(line)
+        else:
+            raise ValueError(f"Dataset {self.dataset_name} is not supported.\
+                only support {self.DATASET_URL.keys()}")
+        messages.append(dict(type='text', value=prompt))
+        messages.append(dict(type='image', value=line['image_path']))
+
+        return messages
+
+    @classmethod
+    def evaluate(self, eval_file, **judge_kwargs):
+        if 'model' in judge_kwargs:
+            model_name = judge_kwargs['model']
+        else:
+            model_name = os.path.basename(os.environ.get('LOCAL_LLM'))
+
+        suffix = eval_file.split('.')[-1]
+        storage = eval_file.replace(f'.{suffix}', f'_{model_name}.xlsx')
+        tmp_file = eval_file.replace(f'.{suffix}', f'_{model}.pkl')
+        nproc = judge_kwargs.pop('nproc', 4)
+
+        if not osp.exists(storage):
+            data = load(eval_file)
+            model = build_judge(**judge_kwargs)
+            assert model.working(), ('CharXiv evaluation requires a working OPENAI API\n' + DEBUG_MESSAGE)
+
+            lt = len(data)
+            lines = [data.iloc[i] for i in range(lt)]
+            indices = [line['index'] for line in lines]
+
+            ans = {}
+            if osp.exists(tmp_file):
+                ans = load(tmp_file)
+            key_set = set(int(x) for key in ans.keys() for x in key.split(','))
+
+            indices = [i for i in indices if i not in key_set]
+
+            if len(indices):
+
+                if self.dataset_name == 'CharXiv_Descriptive':
+                    from utils.charxiv import (
+                        CharXiv_descriptive_auxeval,
+                        preprocess_descriptive_grading_queries,
+                        build_descriptive_grading_queries
+                    )
+                    groups = preprocess_descriptive_grading_queries(lines)
+                    queries = build_descriptive_grading_queries(groups)
+                    query_keys = [query['resp_keys'] for query in queries]
+
+                    new_results = track_progress_rich(
+                            CharXiv_descriptive_auxeval,
+                            tasks=queries,
+                            nproc=nproc,
+                            chunksize=nproc,
+                            keys=query_keys,
+                            save=tmp_file,
+                        )
+                    
+                    ans = load(tmp_file) 
+                    for k, v in zip(query_keys, new_results):
+                        assert k in ans
+                        assert ans[k]['log'] == v['log'] and ans[k]['res'] == v['res']
+                    
+                elif self.dataset_name == 'CharXiv_Reasoning':
+                    from utils.charxiv import build_reasoning_grading_queries, CharXiv_reasoning_auxeval
+                    queries = build_reasoning_grading_queries(lines)
+                    tups = [(model, queries[query]) for query in queries]
+                    new_results = track_progress_rich(
+                            CharXiv_reasoning_auxeval,
+                            tups,
+                            nproc=nproc,
+                            chunksize=nproc,
+                            keys=indices,
+                            save=tmp_file,
+                        )
+
+                    ans = load(tmp_file) 
+                    for k, v in zip(indices, new_results):
+                        assert k in ans
+                        assert ans[k]['log'] == v['log'] and ans[k]['res'] == v['res']
+
+            if self.dataset_name == 'CharXiv_Descriptive':
+                from utils.charxiv import postprocess_descriptive_grading_queries
+                ans = postprocess_descriptive_grading_queries(ans)
+
+            data['res'] = [ans[idx]['res'] for idx in data['index']]
+            data['log'] = [ans[idx]['log'] for idx in data['index']]
+            dump(data, storage)
+
+        if self.dataset_name == 'CharXiv_Descriptive':
+            from utils.charxiv import CharXiv_descriptive_score
+            score = CharXiv_descriptive_score(storage)
+        elif self.dataset_name == 'CharXiv_Reasoning':
+            from utils.charxiv import CharXiv_reasoning_score
+            score = CharXiv_reasoning_score(storage)
+        score_pth = storage.replace('.xlsx', '_score.csv')
+        dump(score, score_pth)
+        return score
